@@ -22,10 +22,22 @@ import (
 )
 
 var (
-	metricPath = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").Envar("MASTODON_EXPORTER_WEB_TELEMETRY_PATH").String()
-	webConfig  = webflag.AddFlags(kingpin.CommandLine, ":9393")
+	databaseURL = kingpin.Flag("mastodon.database_url", "Postgres connection string for the Mastodon database").Envar("DATABASE_URL").String()
+	metricPath  = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").Envar("MASTODON_EXPORTER_WEB_TELEMETRY_PATH").String()
+	webConfig   = webflag.AddFlags(kingpin.CommandLine, ":9393")
 
-	resolutionTimeBuckets = []float64{60, 600, 1800, 3600, 14400, 28800, 86400}
+	// TODO(andrew-d): make configurable?
+	resolutionTimeBuckets = []float64{
+		60,     // 1 minute
+		600,    // 10 minutes
+		1800,   // 30 minutes
+		3600,   // 1 hour
+		14400,  // 4 hours
+		28800,  // 8 hours
+		86400,  // 24 hours
+		172800, // 48 hours
+		604800, // 1 week
+	}
 
 	logger = log.NewNopLogger()
 )
@@ -46,8 +58,8 @@ func main() {
 
 	ctx := context.Background()
 
-	level.Debug(logger).Log("msg", "Connecting to database")
-	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	level.Debug(logger).Log("msg", "Connecting to database", "database_url", *databaseURL)
+	pool, err := pgxpool.New(ctx, *databaseURL)
 	if err != nil {
 		level.Error(logger).Log("msg", "Unable to connect to database", "err", err)
 		os.Exit(1)
