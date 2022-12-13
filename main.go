@@ -113,6 +113,8 @@ func serverMetrics(metricsPath string) http.Handler {
 
 type mastodonExporter struct {
 	db                  *pgxpool.Pool
+	numAccounts         *prometheus.Desc
+	numPosts            *prometheus.Desc
 	numReports          *prometheus.Desc
 	resolvedTimeSeconds *prometheus.Desc
 
@@ -122,6 +124,16 @@ type mastodonExporter struct {
 func newExporter(db *pgxpool.Pool) *mastodonExporter {
 	ret := &mastodonExporter{
 		db: db,
+		numAccounts: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, subsystem, "num_accounts"),
+			"Number of accounts on this Mastodon instance.",
+			[]string{"type"}, nil,
+		),
+		numPosts: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, subsystem, "num_posts"),
+			"Number of posts on this Mastodon instance.",
+			nil, nil,
+		),
 		numReports: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, subsystem, "num_reports"),
 			"Number of reports for this Mastodon instance.",
@@ -143,6 +155,8 @@ func newExporter(db *pgxpool.Pool) *mastodonExporter {
 }
 
 func (m *mastodonExporter) Describe(ch chan<- *prometheus.Desc) {
+	ch <- m.numAccounts
+	ch <- m.numPosts
 	ch <- m.numReports
 	ch <- m.resolvedTimeSeconds
 
@@ -154,8 +168,11 @@ func (m *mastodonExporter) Collect(ch chan<- prometheus.Metric) {
 }
 
 func (m *mastodonExporter) scrape(ctx context.Context, ch chan<- prometheus.Metric) {
+	defer level.Debug(logger).Log("msg", "scrape finished")
+
 	var numErrors int
 
+	level.Debug(logger).Log("msg", "Fetching number of reports")
 	resolved, unresolved, err := m.getNumReports(ctx)
 	if err != nil {
 		level.Error(logger).Log("msg", "Error querying number of reports", "err", err)
@@ -175,12 +192,37 @@ func (m *mastodonExporter) scrape(ctx context.Context, ch chan<- prometheus.Metr
 		)
 	}
 
+	level.Debug(logger).Log("msg", "Fetching report metrics")
 	resolvedHist, err := m.getResolvedStats(ctx)
 	if err != nil {
 		level.Error(logger).Log("msg", "Error querying report metrics", "err", err)
 		numErrors++
 	} else {
 		ch <- resolvedHist
+	}
+
+	level.Debug(logger).Log("msg", "Fetching number of accounts")
+	accounts, err := m.getNumAccounts(ctx)
+	if err != nil {
+		level.Error(logger).Log("msg", "Error querying number of accounts", "err", err)
+		numErrors++
+	} else {
+		for _, m := range accounts {
+			ch <- m
+		}
+	}
+
+	level.Debug(logger).Log("msg", "Fetching number of posts")
+	numPosts, err := m.getNumPosts(ctx)
+	if err != nil {
+		level.Error(logger).Log("msg", "Error querying number of posts", "err", err)
+		numErrors++
+	} else {
+		ch <- prometheus.MustNewConstMetric(
+			m.numPosts,
+			prometheus.GaugeValue,
+			float64(numPosts),
+		)
 	}
 
 	m.errors.Set(float64(numErrors))
@@ -194,6 +236,71 @@ func (m *mastodonExporter) getNumReports(ctx context.Context) (resolved, unresol
 		  COALESCE(COUNT(*) FILTER (WHERE action_taken_at IS NULL), 0) AS unresolved
 		FROM reports
 	`).Scan(&resolved, &unresolved)
+	return
+}
+
+func (m *mastodonExporter) getNumAccounts(ctx context.Context) ([]prometheus.Metric, error) {
+	type labelVal struct {
+		Name string
+		Val  int
+	}
+	var (
+		unsuspended = labelVal{Name: "unsuspended"}
+		bots        = labelVal{Name: "bots"}
+		groups      = labelVal{Name: "groups"}
+		people      = labelVal{Name: "people"}
+		suspended   = labelVal{Name: "suspended"}
+	)
+	err := m.db.QueryRow(ctx, `
+		WITH unsuspended AS (
+		  SELECT * FROM accounts
+		  WHERE domain IS NULL AND suspended_at IS NULL
+		),
+		unsuspended_stats AS (
+		  SELECT COALESCE(COUNT(*), 0) AS unsuspended
+		       , COALESCE(COUNT(*) FILTER (WHERE actor_type = 'Application' OR actor_type = 'Service'), 0) AS bots
+		       , COALESCE(COUNT(*) FILTER (WHERE actor_type = 'Group'), 0) AS groups
+		       , COALESCE(COUNT(*) FILTER (WHERE actor_type = 'Person' OR actor_type IS NULL), 0) AS people
+		  FROM unsuspended
+		),
+		suspended AS (
+		  SELECT COUNT(*) AS num_suspended
+		  FROM accounts
+		  WHERE domain IS NULL AND suspended_at IS NOT NULL
+		)
+		SELECT
+		  a.unsuspended,
+		  a.bots,
+		  a.groups,
+		  a.people,
+		  b.num_suspended
+		FROM unsuspended_stats AS a, suspended AS b
+	`).Scan(&unsuspended.Val, &bots.Val, &groups.Val, &people.Val, &suspended.Val)
+	if err != nil {
+		return nil, err
+	}
+
+	var ret []prometheus.Metric
+	for _, lv := range []labelVal{unsuspended, bots, groups, people, suspended} {
+		ret = append(ret, prometheus.MustNewConstMetric(
+			m.numAccounts,
+			prometheus.GaugeValue,
+			float64(lv.Val),
+			lv.Name,
+		))
+	}
+	return ret, nil
+}
+
+func (m *mastodonExporter) getNumPosts(ctx context.Context) (count int, err error) {
+	err = m.db.QueryRow(ctx, `
+		SELECT
+		  SUM(s.statuses_count)
+		FROM accounts AS a
+		JOIN account_stats AS s
+		  ON a.id = s.account_id
+		WHERE a.domain IS NULL
+	`).Scan(&count)
 	return
 }
 
